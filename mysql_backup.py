@@ -27,7 +27,6 @@ DATABASES = [
     "plex_data",
     "plex_template",
     "production_db",
-    "test_kimex",
 ]
 
 BASE_DIR = Path(r"C:\MySQL_Backup")
@@ -156,7 +155,6 @@ log(f"Destino: {current_backup_dir}")
 log(f"Bases a respaldar: {len(DATABASES)}")
 log("=" * 65)
 
-
 successful = []
 failed = []
 
@@ -191,6 +189,7 @@ for database in DATABASES:
 
         "--single-transaction",
         "--quick",
+        "--skip-lock-tables",
 
         "--routines",
         "--events",
@@ -348,6 +347,22 @@ log(
     f"Respaldos antiguos eliminados: "
     f"{deleted}"
 )
+
+# ============================================================
+# LIMPIEZA DE RESPALDOS ANTIGUOS
+# ============================================================
+
+log("-" * 65)
+
+if not failed:
+    log(f"Revisando respaldos con más de {RETENTION_DAYS} días...")
+    deleted = clean_old_backups()
+    log(f"Respaldos antiguos eliminados: {deleted}")
+else:
+    log(
+        "No se eliminarán respaldos antiguos porque "
+        "el respaldo actual está incompleto."
+    )
 
 
 # ============================================================
