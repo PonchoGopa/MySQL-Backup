@@ -4,6 +4,11 @@ import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
 import time
+import os
+import json
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode, quote
+from urllib.error import HTTPError, URLError
 
 
 # ============================================================
@@ -32,9 +37,19 @@ DATABASES = [
 BASE_DIR = Path(r"C:\MySQL_Backup")
 BACKUP_DIR = BASE_DIR / "backups"
 LOG_DIR = BASE_DIR / "logs"
+ONEDRIVE_BACKUP_DIR = Path(
+    r"C:\Users\IT-D\OneDrive - KI USA MEX\Documentos IT\Backups"
+)
 
 # Días que conservaremos los respaldos
 RETENTION_DAYS = 30
+
+# Microsoft Graph: configurar estas variables en el entorno de la cuenta
+# que ejecuta la tarea programada. Nunca escribir secretos en este archivo.
+# MYSQL_BACKUP_TENANT_ID, MYSQL_BACKUP_CLIENT_ID, MYSQL_BACKUP_CLIENT_SECRET
+EMAIL_SENDER = "sistemas@kiusamex.mx"
+EMAIL_RECIPIENT = "sistemas@kiusamex.mx"
+EMAIL_TIMEOUT_SECONDS = 30
 
 
 # ============================================================
@@ -61,6 +76,77 @@ def format_size(bytes_size):
     """Convierte bytes a MB."""
 
     return bytes_size / (1024 * 1024)
+
+
+def send_confirmation(subject, body):
+    """Solicita el envío a Graph; HTTP 202 confirma aceptación, no entrega."""
+    names = (
+        "MYSQL_BACKUP_TENANT_ID",
+        "MYSQL_BACKUP_CLIENT_ID",
+        "MYSQL_BACKUP_CLIENT_SECRET",
+    )
+    values = [os.environ.get(name, "") for name in names]
+    missing = [name for name, value in zip(names, values) if not value.strip()]
+    if missing:
+        raise RuntimeError("Falta configurar: " + ", ".join(missing))
+    tenant, client, secret = values
+    token_request = Request(
+        "https://login.microsoftonline.com/"
+        + quote(tenant.strip(), safe="") + "/oauth2/v2.0/token",
+        data=urlencode({
+            "client_id": client.strip(),
+            "client_secret": secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        }).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urlopen(token_request, timeout=EMAIL_TIMEOUT_SECONDS) as response:
+            token = json.load(response).get("access_token")
+    except HTTPError as e:
+        raise RuntimeError(
+            f"Autenticación Microsoft 365 rechazada (HTTP {e.code}); "
+            "revisar tenant, aplicación y vigencia del secreto."
+        ) from None
+    except (URLError, OSError, ValueError):
+        raise RuntimeError("No fue posible obtener un token de Microsoft 365.") from None
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("Microsoft 365 no devolvió un token de acceso.")
+
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "Text", "content": body},
+            "toRecipients": [{"emailAddress": {"address": EMAIL_RECIPIENT}}],
+        },
+        "saveToSentItems": True,
+    }
+    request = Request(
+        "https://graph.microsoft.com/v1.0/users/"
+        + quote(EMAIL_SENDER, safe="") + "/sendMail",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=EMAIL_TIMEOUT_SECONDS) as response:
+            if response.status != 202:
+                raise RuntimeError(f"Respuesta inesperada de Graph: HTTP {response.status}.")
+    except HTTPError as e:
+        raise RuntimeError(
+            f"Graph rechazó el correo (HTTP {e.code}); revisar permiso Mail.Send y buzón."
+        ) from None
+    except (URLError, OSError):
+        # No reintentar automáticamente: un timeout puede ocurrir después
+        # de que Graph haya aceptado el mensaje y producir duplicados.
+        raise RuntimeError(
+            "No se pudo confirmar la aceptación del correo; revisar red y Elementos enviados."
+        ) from None
 
 
 def compress_file(source_file, compressed_file):
@@ -332,37 +418,56 @@ for database in DATABASES:
 
 
 # ============================================================
-# RETENCIÓN
+# COPIA SECUNDARIA Y RETENCIÓN LOCAL
 # ============================================================
 
-log("-" * 65)
-log(
-    f"Revisando respaldos con más de "
-    f"{RETENTION_DAYS} días..."
-)
-
-deleted = clean_old_backups()
-
-log(
-    f"Respaldos antiguos eliminados: "
-    f"{deleted}"
-)
-
-# ============================================================
-# LIMPIEZA DE RESPALDOS ANTIGUOS
-# ============================================================
+local_complete = not failed and len(successful) == len(DATABASES) == 10
+secondary_complete = False
+retention_failed = False
 
 log("-" * 65)
 
-if not failed:
-    log(f"Revisando respaldos con más de {RETENTION_DAYS} días...")
-    deleted = clean_old_backups()
-    log(f"Respaldos antiguos eliminados: {deleted}")
+if local_complete:
+    secondary_dir = ONEDRIVE_BACKUP_DIR / backup_date
+    log(f"INICIO de copia secundaria a OneDrive: {secondary_dir}")
+    try:
+        # No mezclar esta ejecución con una carpeta que ya exista.
+        ONEDRIVE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(current_backup_dir, secondary_dir)
+
+        # Confirmar que los diez archivos copiados existen y tienen
+        # el mismo tamaño que los originales antes de permitir retención.
+        for database in DATABASES:
+            source = current_backup_dir / f"{database}.sql.gz"
+            target = secondary_dir / source.name
+            if not target.is_file() or target.stat().st_size != source.stat().st_size:
+                raise OSError(f"Copia incompleta o tamaño incorrecto: {target}")
+
+        secondary_complete = True
+        log(f"ÉXITO de copia secundaria a OneDrive: {secondary_dir}")
+        # Esto confirma la copia a la carpeta local de OneDrive.
+        # La sincronización a la nube la realiza el cliente OneDrive.
+    except Exception as e:
+        log(f"ERROR en copia secundaria a OneDrive: {e}")
+        log("La carpeta secundaria puede estar incompleta; se conserva para revisión.")
+else:
+    log("Copia secundaria omitida: no se completaron correctamente las 10 bases.")
+
+if local_complete and secondary_complete:
+    try:
+        log(f"Revisando respaldos locales con más de {RETENTION_DAYS} días...")
+        deleted = clean_old_backups()
+        log(f"Respaldos locales antiguos eliminados: {deleted}")
+    except Exception as e:
+        retention_failed = True
+        log(f"ERROR en retención local: {e}")
 else:
     log(
-        "No se eliminarán respaldos antiguos porque "
-        "el respaldo actual está incompleto."
+        "No se eliminarán respaldos locales antiguos porque "
+        "el respaldo actual o su copia secundaria está incompleto."
     )
+
+backup_complete = local_complete and secondary_complete and not retention_failed
 
 
 # ============================================================
@@ -430,7 +535,7 @@ log(
 )
 
 
-if failed:
+if not backup_complete:
 
     log("ESTADO FINAL: BACKUP INCOMPLETO")
 
@@ -445,10 +550,50 @@ log("=" * 65)
 
 
 # ============================================================
+# CORREO DE CONFIRMACIÓN
+# ============================================================
+
+notification_failed = False
+if local_complete and secondary_complete:
+    log(f"INICIO de correo de confirmación: {EMAIL_RECIPIENT}")
+    retention_status = (
+        "ERROR: revisar backup.log."
+        if retention_failed else f"Correcta ({RETENTION_DAYS} días)."
+    )
+    subject = f"[MySQL Backup] Dos copias completadas - {backup_date}"
+    body = (
+        "Se completaron correctamente el respaldo local y la copia secundaria.\n\n"
+        f"Inicio: {backup_start:%Y-%m-%d %H:%M:%S}\n"
+        f"Fin: {backup_end:%Y-%m-%d %H:%M:%S}\n"
+        f"Bases respaldadas: {len(successful)}/{len(DATABASES)}\n"
+        f"Bases: {', '.join(successful)}\n\n"
+        f"Respaldo local: {current_backup_dir}\n"
+        f"Copia secundaria: {secondary_dir}\n\n"
+        f"Tamaño comprimido: {format_size(total_compressed_size):.2f} MB\n"
+        f"Duración del proceso antes del correo: {duration:.1f} segundos\n"
+        f"Retención local: {retention_status}\n\n"
+        "La copia secundaria se verificó en la carpeta local de OneDrive. "
+        "Este aviso no confirma la sincronización a la nube; "
+        "esa operación depende del cliente OneDrive.\n"
+    )
+    try:
+        send_confirmation(subject, body)
+        log("ÉXITO: Microsoft 365 aceptó el correo para envío (HTTP 202).")
+    except Exception as e:
+        notification_failed = True
+        log(f"ERROR en correo de confirmación: {e}")
+        log("Los respaldos se conservaron; la tarea terminará con código 1 por el aviso fallido.")
+else:
+    log("Correo de confirmación omitido: no se completaron ambos respaldos.")
+
+log(f"RESULTADO DE LA TAREA: código {1 if not backup_complete or notification_failed else 0}")
+
+
+# ============================================================
 # EXIT CODE
 # ============================================================
 
-if failed:
+if not backup_complete or notification_failed:
     raise SystemExit(1)
 
 raise SystemExit(0)
